@@ -466,6 +466,161 @@ impl Router {
             .await
     }
 
+    // ===================== [PATCH: /v1/messages proxy] =====================
+    // Raw byte-passthrough proxy to a selected worker's `path`.
+    //
+    // Unlike `route_typed_request`, this method:
+    //   * does NOT parse the body into a typed protocol struct — the body
+    //     is forwarded as-is, so callers may use it for endpoints whose
+    //     schema is not represented in the `openai-protocol` crate
+    //     (e.g. Anthropic Messages API).
+    //   * does NOT retry (streaming semantics make retry unsafe).
+    //   * does NOT emit router-level metrics (avoids polluting the fixed
+    //     label set with new endpoints).
+    //
+    // Worker selection reuses `select_worker_for_model`, which honours
+    // circuit breaker, availability, and per-model routing. Since we have
+    // no request text (would require decoding the body), no cache-aware /
+    // prefix-hash routing is possible; the selection falls back to the
+    // policy's model-agnostic path.
+    pub async fn proxy_raw_to_worker(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: axum::body::Bytes,
+        path: &'static str,
+        model_id: Option<&str>,
+        is_stream: bool,
+    ) -> Response {
+        let worker = match self
+            .select_worker_for_model(model_id, None, headers)
+            .await
+        {
+            Some(w) => w,
+            None => {
+                return error::service_unavailable(
+                    "no_available_workers",
+                    "No available workers (all circuits open or unhealthy)",
+                );
+            }
+        };
+
+        let worker_url = worker.url();
+        // Honour dp_aware: split `<url>@<dp_rank>`.
+        let (target_base, dp_rank) = if self.dp_aware {
+            match Self::extract_dp_rank(worker_url) {
+                Ok((prefix, rank)) => (prefix.to_string(), Some(rank)),
+                Err(e) => {
+                    error!("Failed to extract dp_rank for anthropic proxy: {}", e);
+                    return error::internal_error(
+                        "dp_rank_extraction_failed",
+                        format!("Failed to extract dp_rank: {}", e),
+                    );
+                }
+            }
+        } else {
+            (worker_url.to_string(), None)
+        };
+
+        // If dp_aware, we must inject `data_parallel_rank` into the JSON
+        // body. This requires the body to be a JSON object.
+        let effective_body: axum::body::Bytes = if let Some(rank) = dp_rank {
+            match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(mut v) if v.is_object() => {
+                    if let Some(map) = v.as_object_mut() {
+                        map.insert(
+                            "data_parallel_rank".to_string(),
+                            serde_json::json!(rank),
+                        );
+                    }
+                    match serde_json::to_vec(&v) {
+                        Ok(bytes) => axum::body::Bytes::from(bytes),
+                        Err(e) => {
+                            return error::internal_error(
+                                "body_reserialize_failed",
+                                format!("Failed to reserialize body: {}", e),
+                            );
+                        }
+                    }
+                }
+                _ => body,
+            }
+        } else {
+            body
+        };
+
+        let mut request_builder = self
+            .client
+            .post(format!("{}{}", target_base, path))
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(effective_body);
+
+        if let Some(key) = worker.api_key().clone() {
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
+        }
+
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if header_utils::should_forward_request_header(name.as_str()) {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        }
+
+        let res = match request_builder.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!(
+                    "anthropic proxy send failed: worker_url={} path={} error={}",
+                    worker_url, path, e
+                );
+                worker.record_outcome(false);
+                return convert_reqwest_error(e);
+            }
+        };
+
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        if !is_stream {
+            worker.record_outcome(status.is_success());
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            match res.bytes().await {
+                Ok(body_bytes) => {
+                    let mut response = Response::new(axum::body::Body::from(body_bytes));
+                    *response.status_mut() = status;
+                    *response.headers_mut() = response_headers;
+                    response
+                }
+                Err(e) => error::internal_error(
+                    "read_response_body_failed",
+                    format!("Failed to read response body: {}", e),
+                ),
+            }
+        } else {
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+
+            let mut tracked = BreakerTrackedStream::new(
+                res.bytes_stream(),
+                worker.clone(),
+                worker_url.to_string(),
+            );
+            if !status.is_success() {
+                tracked.mark_errored();
+            }
+            let body = axum::body::Body::from_stream(tracked);
+
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            response
+        }
+    }
+    // =================== [/PATCH: /v1/messages proxy] ======================
+
     // TODO (rui): Better accommodate to the Worker abstraction
     fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
         let parts: Vec<&str> = worker_url.split('@').collect();

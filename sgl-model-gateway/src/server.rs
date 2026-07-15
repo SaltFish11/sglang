@@ -215,6 +215,91 @@ async fn v1_rerank(
         .await
 }
 
+// ===================== [PATCH: /v1/messages proxy] =====================
+// Forward Anthropic Messages API requests to a backend sglang worker's
+// `/v1/messages` (implemented in python/sglang/srt/entrypoints/anthropic/).
+// Pure passthrough — no protocol conversion done here.
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    anthropic_proxy(state, headers, body, "/v1/messages").await
+}
+
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    anthropic_proxy(state, headers, body, "/v1/messages/count_tokens").await
+}
+
+async fn anthropic_proxy(
+    state: Arc<AppState>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+    path: &'static str,
+) -> Response {
+    // Peek the JSON body ONCE to extract `model` (for worker selection) and
+    // `stream` (to choose response mode). Failure is non-fatal: falls back
+    // to model-agnostic non-streaming routing.
+    let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+    let model_id: Option<String> = parsed_body
+        .as_ref()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
+    let is_stream: bool = parsed_body
+        .as_ref()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false);
+
+    // In v0.5.13.post1 `AppState.router` is actually a `RouterManager`
+    // dispatcher; downcasting it to the concrete http `Router` always
+    // fails. Ask the manager for the router that owns `model_id`
+    // (same lookup path `route_typed_request` uses for existing routes),
+    // then downcast THAT to `http::router::Router`.
+    let selected_router: Arc<dyn RouterTrait> = if let Some(mgr) = state.router_manager.as_ref() {
+        match mgr.select_router_for_request(Some(&headers), model_id.as_deref()) {
+            Some(r) => r,
+            None => {
+                return crate::routers::error::service_unavailable(
+                    "no_router_for_model",
+                    "No router matches the request (unknown model or no workers registered)",
+                );
+            }
+        }
+    } else {
+        // Fallback for hypothetical builds that keep a plain single-router
+        // AppState.router (pre-RouterManager code path).
+        state.router.clone()
+    };
+
+    let http_router = match selected_router
+        .as_any()
+        .downcast_ref::<crate::routers::http::router::Router>()
+    {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                "/v1/messages is only supported when router mode is 'Regular' (HTTP)",
+            )
+                .into_response();
+        }
+    };
+
+    http_router
+        .proxy_raw_to_worker(
+            Some(&headers),
+            body,
+            path,
+            model_id.as_deref(),
+            is_stream,
+        )
+        .await
+}
+// =================== [/PATCH: /v1/messages proxy] ======================
+
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
@@ -548,6 +633,13 @@ pub fn build_app(
         .route("/v1/rerank", post(v1_rerank))
         .route("/v1/responses", post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
+        // ===== [PATCH: /v1/messages proxy] =====
+        .route("/v1/messages", post(v1_messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(v1_messages_count_tokens),
+        )
+        // ===== [/PATCH] =====
         .route("/v1/classify", post(v1_classify))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
