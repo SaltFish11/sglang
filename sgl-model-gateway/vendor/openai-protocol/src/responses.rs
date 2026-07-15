@@ -17,6 +17,34 @@ use super::{
 use crate::{builders::ResponsesResponseBuilder, validated::Normalizable};
 
 // ============================================================================
+// Helper: deserialize function_call_output.output as plain text
+// Accepts either `"string"` or `[{"type":"input_text","text":"..."},...]`.
+// ============================================================================
+fn deserialize_output_as_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::String(s) => Ok(s),
+        Value::Array(arr) => {
+            // Extract text from content-block array
+            let mut parts: Vec<String> = Vec::new();
+            for item in &arr {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_owned());
+                }
+            }
+            Ok(parts.join(""))
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "function_call_output.output must be a string or array, got: {}",
+            other
+        ))),
+    }
+}
+
+// ============================================================================
 // Response Tools (MCP and others)
 // ============================================================================
 
@@ -178,6 +206,10 @@ pub enum ResponseInputOutputItem {
     FunctionCallOutput {
         id: Option<String>,
         call_id: String,
+        /// Accepts either a plain string or a content-block array
+        /// (`[{"type":"input_text","text":"..."}]`).
+        /// Internally always stored as a plain String (text extracted from blocks).
+        #[serde(deserialize_with = "deserialize_output_as_text")]
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
