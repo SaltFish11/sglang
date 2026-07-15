@@ -885,10 +885,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ],
             }
         if msg_type == "function_call_output":
+            # ``output`` may be a plain string or a list of Responses-API
+            # content parts (e.g. ``input_text``/``output_text``/``input_image``).
+            # Chat Completions doesn't recognize the Responses-only part types,
+            # so normalize each part just like a regular ``message`` content
+            # (otherwise pydantic rejects the tool message with a union error).
+            output = message.get("output", "")
+            if isinstance(output, list):
+                output = [
+                    cls._normalize_response_content_part_for_chat(part)
+                    for part in output
+                ]
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": message.get("output", ""),
+                "content": output,
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
