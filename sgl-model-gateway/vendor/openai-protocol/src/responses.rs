@@ -184,7 +184,7 @@ pub enum ResponseInputOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        summary: Vec<String>,
+        summary: Vec<ResponseReasoningSummary>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         #[serde(default)]
         content: Vec<ResponseReasoningContent>,
@@ -251,6 +251,21 @@ pub enum ResponseReasoningContent {
     ReasoningText { text: String },
 }
 
+/// A single entry of a reasoning item's `summary` field.
+///
+/// OpenAI spec: `ReasoningItem.summary` is `list[SummaryText]` where
+/// `SummaryText = {type: "summary_text", text: string}`. This was
+/// previously typed as `Vec<String>`, which rejected any non-empty
+/// `summary` sent by clients (e.g. codex CLI replaying a prior turn's
+/// reasoning item) with "data did not match any variant of untagged
+/// enum ResponseInput".
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseReasoningSummary {
+    SummaryText { text: String },
+}
+
 /// MCP Tool information for the mcp_list_tools output item
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpToolInfo {
@@ -276,7 +291,7 @@ pub enum ResponseOutputItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: String,
-        summary: Vec<String>,
+        summary: Vec<ResponseReasoningSummary>,
         content: Vec<ResponseReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
@@ -1302,7 +1317,7 @@ impl ResponseOutputItem {
     /// Create a new reasoning output item
     pub fn new_reasoning(
         id: String,
-        summary: Vec<String>,
+        summary: Vec<ResponseReasoningSummary>,
         content: Vec<ResponseReasoningContent>,
         status: Option<String>,
     ) -> Self {
