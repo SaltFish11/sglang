@@ -131,7 +131,7 @@ pub(super) fn build_next_request_with_tools(
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
         items.push(ResponseInputOutputItem::Reasoning {
-            id: format!("reasoning_{}", assistant_id),
+            id: Some(format!("reasoning_{}", assistant_id)),
             summary: vec![],
             content: vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,

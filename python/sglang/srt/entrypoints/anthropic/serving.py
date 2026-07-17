@@ -7,6 +7,8 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import uuid
@@ -15,6 +17,16 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
+
+try:
+    from pypdf import PdfReader  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    PdfReader = None
+
+try:
+    import pypdfium2 as pdfium  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pdfium = None
 
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
@@ -58,6 +70,146 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 
 logger = logging.getLogger(__name__)
+
+# Limits for inline PDF text extraction on the Anthropic `document` content
+# block (base64 source). Documents larger than this are not parsed at all
+# (avoids a slow/huge decode on the request path); extracted text longer
+# than this is truncated so a single document can't blow out the model's
+# context window.
+_MAX_PDF_BYTES_FOR_EXTRACTION = 20 * 1024 * 1024  # 20 MiB
+_MAX_PDF_EXTRACTED_CHARS = 100_000
+
+_pypdf_missing_warned = False
+
+
+def _extract_pdf_text(pdf_bytes: bytes) -> Optional[str]:
+    """Best-effort text extraction for a base64-decoded PDF document.
+
+    Returns the extracted text (per-page text joined with blank lines and
+    truncated to ``_MAX_PDF_EXTRACTED_CHARS``), or ``None`` if the PDF has
+    no extractable text layer (e.g. a scanned/image-only PDF), the optional
+    ``pypdf`` dependency isn't installed, the document exceeds the size
+    limit, or parsing fails for any reason. Callers should fall back to a
+    placeholder notice when ``None`` is returned.
+    """
+    global _pypdf_missing_warned
+    if PdfReader is None:
+        if not _pypdf_missing_warned:
+            logger.warning(
+                "Received a base64 PDF `document` content block but the "
+                "optional `pypdf` dependency is not installed; falling "
+                "back to a placeholder notice instead of the real content. "
+                "Install it with `pip install pypdf` to enable inline PDF "
+                "text extraction."
+            )
+            _pypdf_missing_warned = True
+        return None
+
+    if len(pdf_bytes) > _MAX_PDF_BYTES_FOR_EXTRACTION:
+        logger.warning(
+            "Skipping PDF text extraction: document is %d bytes, exceeds "
+            "the %d byte limit.",
+            len(pdf_bytes),
+            _MAX_PDF_BYTES_FOR_EXTRACTION,
+        )
+        return None
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages_text = [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as e:  # noqa: BLE001 - any parse failure should degrade gracefully
+        logger.warning("Failed to extract text from base64 PDF document: %s", e)
+        return None
+
+    text = "\n\n".join(p for p in pages_text if p)
+    if not text:
+        # No extractable text layer (e.g. scanned/image-only PDF).
+        return None
+
+    if len(text) > _MAX_PDF_EXTRACTED_CHARS:
+        text = (
+            text[:_MAX_PDF_EXTRACTED_CHARS]
+            + f"\n[... PDF text truncated at {_MAX_PDF_EXTRACTED_CHARS} characters ...]"
+        )
+    return text
+
+
+# Limits for rendering PDF pages as images for vision-capable models. Capped
+# independently of the text-extraction limits above: rendering is far more
+# expensive per page (each page becomes a full image in the model's
+# context), so a much lower page count is allowed even though the byte-size
+# gate on the source PDF is shared with `_extract_pdf_text`.
+_MAX_PDF_PAGES_FOR_IMAGE_RENDER = 20
+_PDF_PAGE_RENDER_SCALE = 2.0  # ~144 DPI (pdfium renders at 72 DPI per unit scale)
+
+_pdfium_missing_warned = False
+
+
+def _render_pdf_pages_as_images(pdf_bytes: bytes) -> list[bytes]:
+    """Best-effort rasterization of a PDF's pages into PNG images.
+
+    Intended for vision-capable (multimodal) models: some PDF content (scans,
+    tables, charts, handwriting, dense layouts) either has no text layer at
+    all or loses structure when flattened to plain text by
+    ``_extract_pdf_text``. Rendering pages as images lets a vision model
+    "see" that content directly, in addition to (not instead of) the text
+    extraction.
+
+    Returns a list of PNG-encoded bytes, one per rendered page, up to
+    ``_MAX_PDF_PAGES_FOR_IMAGE_RENDER`` pages. Returns an empty list if the
+    optional `pypdfium2` dependency isn't installed, the source PDF exceeds
+    the size limit, or rendering fails for any reason — callers should treat
+    that as "no images available" and rely on text extraction / the
+    placeholder notice instead.
+    """
+    global _pdfium_missing_warned
+    if pdfium is None:
+        if not _pdfium_missing_warned:
+            logger.warning(
+                "Received a base64 PDF `document` content block for a "
+                "multimodal model, but the optional `pypdfium2` dependency "
+                "is not installed; skipping page-image rendering (falling "
+                "back to text extraction only). Install it with "
+                "`pip install pypdfium2` to enable this."
+            )
+            _pdfium_missing_warned = True
+        return []
+
+    if len(pdf_bytes) > _MAX_PDF_BYTES_FOR_EXTRACTION:
+        # Already logged by `_extract_pdf_text` when it runs first on the
+        # same bytes; avoid a duplicate warning here.
+        return []
+
+    images: list[bytes] = []
+    try:
+        pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
+        try:
+            num_pages = len(pdf)
+            if num_pages > _MAX_PDF_PAGES_FOR_IMAGE_RENDER:
+                logger.warning(
+                    "PDF has %d pages; only rendering the first %d as "
+                    "images for the vision-capable model.",
+                    num_pages,
+                    _MAX_PDF_PAGES_FOR_IMAGE_RENDER,
+                )
+            for page_index in range(min(num_pages, _MAX_PDF_PAGES_FOR_IMAGE_RENDER)):
+                page = pdf[page_index]
+                try:
+                    bitmap = page.render(scale=_PDF_PAGE_RENDER_SCALE)
+                    pil_image = bitmap.to_pil()
+                    buf = io.BytesIO()
+                    pil_image.save(buf, format="PNG")
+                    images.append(buf.getvalue())
+                finally:
+                    page.close()
+        finally:
+            pdf.close()
+    except Exception as e:  # noqa: BLE001 - any render failure should degrade gracefully
+        logger.warning("Failed to render PDF pages as images: %s", e)
+        return []
+
+    return images
+
 
 # Map OpenAI finish reasons to Anthropic stop reasons. Only the four
 # values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
@@ -198,6 +350,21 @@ class AnthropicServing:
     ) -> ChatCompletionRequest:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
+
+        # Whether the backing model is vision-capable. Drives the
+        # `document` block's base64-PDF handling below: multimodal models
+        # additionally get the PDF's pages rendered as images (see
+        # `_render_pdf_pages_as_images`) so they can "see" content a text
+        # layer can't capture (scans, tables, charts, handwriting, etc.),
+        # on top of the plain-text extraction that already applies to all
+        # models.
+        try:
+            is_multimodal = bool(
+                self.openai_serving_chat
+                and self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
+            )
+        except AttributeError:
+            is_multimodal = False
 
         def _convert_anthropic_image_source_to_openai_part(
             source: Any,
@@ -424,17 +591,35 @@ class AnthropicServing:
                         content_parts.append(image_part)
 
                 elif block.type == "document":
-                    # Local models cannot natively parse binary PDF content.
-                    # We do a best-effort conversion:
-                    #   - text source  → pass the text directly
-                    #   - base64/url   → emit a notice so the model knows a
-                    #                    document was provided but cannot be read
+                    # Local models cannot natively view binary documents, so
+                    # we do a best-effort conversion:
+                    #   - text source        → pass the text directly
+                    #   - base64 PDF         → extract the text layer with
+                    #                          `pypdf` and pass that through.
+                    #                          If the backing model is
+                    #                          multimodal, ALSO render each
+                    #                          page as an image with
+                    #                          `pypdfium2` and pass those
+                    #                          through as `image_url` parts,
+                    #                          since a vision model can read
+                    #                          content (scans, tables,
+                    #                          charts, handwriting) that the
+                    #                          text layer alone can't
+                    #                          capture. Falls back to a
+                    #                          placeholder notice only if
+                    #                          neither text nor (for
+                    #                          multimodal models) images
+                    #                          could be produced.
+                    #   - other base64 / url → emit a notice so the model
+                    #                          knows a document was provided
+                    #                          but cannot be read
                     doc_text_parts = []
                     if block.title:
                         doc_text_parts.append(f"[Document title: {block.title}]")
                     if block.context:
                         doc_text_parts.append(f"[Document context: {block.context}]")
 
+                    pdf_page_images: list[bytes] = []
                     source = block.source
                     if source is not None:
                         if isinstance(source, BaseModel):
@@ -446,11 +631,36 @@ class AnthropicServing:
                                 if text_data:
                                     doc_text_parts.append(text_data)
                             elif src_type == "base64":
-                                media_type = source.get("media_type", "application/octet-stream")
-                                doc_text_parts.append(
-                                    f"[Binary document ({media_type}) provided as base64; "
-                                    "content cannot be decoded by this model.]"
+                                media_type = source.get(
+                                    "media_type", "application/octet-stream"
                                 )
+                                extracted_text = None
+                                raw_data = source.get("data", "")
+                                if media_type == "application/pdf" and raw_data:
+                                    try:
+                                        pdf_bytes = base64.b64decode(
+                                            raw_data, validate=False
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to base64-decode PDF "
+                                            "document: %s",
+                                            e,
+                                        )
+                                        pdf_bytes = None
+                                    if pdf_bytes:
+                                        extracted_text = _extract_pdf_text(pdf_bytes)
+                                        if is_multimodal:
+                                            pdf_page_images = (
+                                                _render_pdf_pages_as_images(pdf_bytes)
+                                            )
+                                if extracted_text:
+                                    doc_text_parts.append(extracted_text)
+                                if not extracted_text and not pdf_page_images:
+                                    doc_text_parts.append(
+                                        f"[Binary document ({media_type}) provided as base64; "
+                                        "content cannot be decoded by this model.]"
+                                    )
                             elif src_type == "url":
                                 url = source.get("url", "")
                                 if url:
@@ -459,6 +669,16 @@ class AnthropicServing:
                     if doc_text_parts:
                         content_parts.append(
                             {"type": "text", "text": "\n".join(doc_text_parts)}
+                        )
+                    for page_png in pdf_page_images:
+                        content_parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,"
+                                    + base64.b64encode(page_png).decode("ascii"),
+                                },
+                            }
                         )
 
                 elif block.type == "search_result":

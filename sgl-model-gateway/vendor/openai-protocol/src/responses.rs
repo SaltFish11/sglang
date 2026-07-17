@@ -183,7 +183,15 @@ pub enum ResponseInputOutputItem {
     },
     #[serde(rename = "reasoning")]
     Reasoning {
-        id: String,
+        /// `id` is server-assigned metadata per the OpenAI Responses spec,
+        /// not a required client-supplied field. codex CLI 0.142.3 omits
+        /// it on some tool-loop replay paths (e.g. a `summary=[]`,
+        /// `content=[reasoning_text]` reasoning item with no id), which
+        /// previously 400'd the whole request with "data did not match
+        /// any variant of untagged enum ResponseInput" — mirrors the
+        /// `FunctionCallOutput.id` fix below.
+        #[serde(default)]
+        id: Option<String>,
         summary: Vec<ResponseReasoningSummary>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         #[serde(default)]

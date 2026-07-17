@@ -58,6 +58,8 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
+  "pypdf",  # inline text extraction for Anthropic `document` (base64 PDF) content blocks
+  "pypdfium2",  # renders PDF pages as images for Anthropic `document` blocks on multimodal models
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels>=0.4.1",
