@@ -19,9 +19,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 try:
-    from pypdf import PdfReader  # type: ignore
+    import pdfplumber  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
-    PdfReader = None
+    pdfplumber = None
 
 try:
     import pypdfium2 as pdfium  # type: ignore
@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 _MAX_PDF_BYTES_FOR_EXTRACTION = 20 * 1024 * 1024  # 20 MiB
 _MAX_PDF_EXTRACTED_CHARS = 100_000
 
-_pypdf_missing_warned = False
+_pdfplumber_missing_warned = False
 
 
 def _extract_pdf_text(pdf_bytes: bytes) -> Optional[str]:
@@ -88,21 +88,21 @@ def _extract_pdf_text(pdf_bytes: bytes) -> Optional[str]:
     Returns the extracted text (per-page text joined with blank lines and
     truncated to ``_MAX_PDF_EXTRACTED_CHARS``), or ``None`` if the PDF has
     no extractable text layer (e.g. a scanned/image-only PDF), the optional
-    ``pypdf`` dependency isn't installed, the document exceeds the size
+    ``pdfplumber`` dependency isn't installed, the document exceeds the size
     limit, or parsing fails for any reason. Callers should fall back to a
     placeholder notice when ``None`` is returned.
     """
-    global _pypdf_missing_warned
-    if PdfReader is None:
-        if not _pypdf_missing_warned:
+    global _pdfplumber_missing_warned
+    if pdfplumber is None:
+        if not _pdfplumber_missing_warned:
             logger.warning(
                 "Received a base64 PDF `document` content block but the "
-                "optional `pypdf` dependency is not installed; falling "
+                "optional `pdfplumber` dependency is not installed; falling "
                 "back to a placeholder notice instead of the real content. "
-                "Install it with `pip install pypdf` to enable inline PDF "
-                "text extraction."
+                "Install it with `pip install pdfplumber` to enable inline "
+                "PDF text extraction."
             )
-            _pypdf_missing_warned = True
+            _pdfplumber_missing_warned = True
         return None
 
     if len(pdf_bytes) > _MAX_PDF_BYTES_FOR_EXTRACTION:
@@ -115,8 +115,8 @@ def _extract_pdf_text(pdf_bytes: bytes) -> Optional[str]:
         return None
 
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages_text = [(page.extract_text() or "").strip() for page in reader.pages]
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages_text = [(page.extract_text() or "").strip() for page in pdf.pages]
     except Exception as e:  # noqa: BLE001 - any parse failure should degrade gracefully
         logger.warning("Failed to extract text from base64 PDF document: %s", e)
         return None
@@ -595,7 +595,8 @@ class AnthropicServing:
                     # we do a best-effort conversion:
                     #   - text source        → pass the text directly
                     #   - base64 PDF         → extract the text layer with
-                    #                          `pypdf` and pass that through.
+                    #                          `pdfplumber` and pass that
+                    #                          through.
                     #                          If the backing model is
                     #                          multimodal, ALSO render each
                     #                          page as an image with
