@@ -201,7 +201,16 @@ pub enum ResponseInputOutputItem {
     },
     #[serde(rename = "function_call")]
     FunctionToolCall {
-        id: String,
+        /// `id` is server-assigned metadata per the OpenAI Responses spec,
+        /// not a required client-supplied field — mirrors the `Reasoning.id`
+        /// and `FunctionCallOutput.id` fix above. Some clients (e.g. codex
+        /// CLI tool-loop replay) reconstruct a `function_call` item from
+        /// just `call_id`/`name`/`arguments` and omit `id`, which previously
+        /// 400'd the whole request with "data did not match any variant of
+        /// untagged enum ResponseInput". `call_id` remains the required
+        /// field callers should key off of; `id` is optional metadata.
+        #[serde(default)]
+        id: Option<String>,
         call_id: String,
         name: String,
         arguments: String,

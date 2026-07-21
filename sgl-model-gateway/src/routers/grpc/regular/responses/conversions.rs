@@ -86,6 +86,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     }
                     ResponseInputOutputItem::FunctionToolCall {
                         id,
+                        call_id,
                         name,
                         arguments,
                         output,
@@ -93,13 +94,19 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     } => {
                         // Tool call from history - add as assistant message with tool call
                         // followed by tool response if output exists
+                        //
+                        // `id` is optional (server-assigned metadata, see the
+                        // `ResponseInputOutputItem::FunctionToolCall` doc comment);
+                        // fall back to `call_id`, which is always present and is
+                        // what downstream ChatMessage::Tool matching keys off of.
+                        let effective_id = id.clone().unwrap_or_else(|| call_id.clone());
 
                         // Add assistant message with tool_calls (the LLM's decision)
                         messages.push(ChatMessage::Assistant {
                             content: None,
                             name: None,
                             tool_calls: Some(vec![ToolCall {
-                                id: id.clone(),
+                                id: effective_id.clone(),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name: name.clone(),
@@ -113,7 +120,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         if let Some(output_text) = output {
                             messages.push(ChatMessage::Tool {
                                 content: MessageContent::Text(output_text.clone()),
-                                tool_call_id: id.clone(),
+                                tool_call_id: effective_id.clone(),
                             });
                         }
                     }
