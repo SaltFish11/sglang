@@ -12,16 +12,16 @@ use openai_harmony::{
     },
     HarmonyEncoding, HarmonyEncodingName,
 };
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::types::HarmonyBuildOutput;
 use crate::protocols::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{ContentPart, Tool},
     responses::{
-        ReasoningEffort as ResponsesReasoningEffort, ResponseContentPart, ResponseInput,
-        ResponseInputOutputItem, ResponseReasoningContent, ResponseTool, ResponseToolType,
-        ResponsesRequest, StringOrContentParts,
+        FunctionCallOutputContent, ReasoningEffort as ResponsesReasoningEffort,
+        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseReasoningContent,
+        ResponseTool, ResponseToolType, ResponsesRequest, StringOrContentParts,
     },
 };
 
@@ -503,13 +503,27 @@ impl HarmonyBuilder {
                     _ => Role::User, // Default to user for unknown roles
                 };
 
-                // Extract text from content parts
+                // Extract text from content parts. The Harmony `Content` enum
+                // (from the `openai_harmony` crate) has no image variant, so
+                // `input_image` parts can't be carried through this path —
+                // best-effort: extract whatever text is present and log a
+                // warning instead of silently losing the image.
+                if content
+                    .iter()
+                    .any(|part| matches!(part, ResponseContentPart::InputImage { .. }))
+                {
+                    warn!(
+                        "Dropping input_image content in a Harmony-path message: \
+                         the Harmony protocol has no image content type."
+                    );
+                }
                 let text_parts: Vec<String> = content
                     .iter()
                     .filter_map(|part| match part {
                         ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                         ResponseContentPart::InputText { text } => Some(text.clone()),
-                        ResponseContentPart::Unknown => None,
+                        ResponseContentPart::InputImage { .. }
+                        | ResponseContentPart::Unknown => None,
                     })
                     .collect();
 
@@ -626,6 +640,20 @@ impl HarmonyBuilder {
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {}", call_id))?;
 
+                // The Harmony `Content` enum has no image variant, so an
+                // image-bearing `output` (e.g. a `view_image` tool result)
+                // can only be flattened to its text parts here — warn rather
+                // than silently dropping the image.
+                if matches!(output, FunctionCallOutputContent::Parts(parts)
+                    if parts.iter().any(|p| matches!(p, ResponseContentPart::InputImage { .. })))
+                {
+                    warn!(
+                        call_id = %call_id,
+                        "Dropping input_image content in a Harmony-path function_call_output: \
+                         the Harmony protocol has no image content type."
+                    );
+                }
+
                 // Create Tool message with "functions.{name}" prefix
                 // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
                 // We keep channel=None to minimize what the model might copy.
@@ -636,7 +664,7 @@ impl HarmonyBuilder {
                     },
                     recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
-                            text: output.clone(),
+                            text: output.to_plain_text(),
                         })],
                     channel: None,
                     content_type: None,
@@ -655,13 +683,29 @@ impl HarmonyBuilder {
                 let text = match content {
                     StringOrContentParts::String(s) => s.clone(),
                     StringOrContentParts::Array(parts) => {
+                        // The Harmony `Content` enum has no image variant, so
+                        // `input_image` parts can't be carried through this
+                        // path — best-effort: extract whatever text is
+                        // present and log a warning instead of silently
+                        // losing the image.
+                        if parts
+                            .iter()
+                            .any(|part| matches!(part, ResponseContentPart::InputImage { .. }))
+                        {
+                            warn!(
+                                "Dropping input_image content in a Harmony-path \
+                                 simple input message: the Harmony protocol has no \
+                                 image content type."
+                            );
+                        }
                         // Extract text from content parts
                         parts
                             .iter()
                             .filter_map(|part| match part {
                                 ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                                 ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Unknown => None,
+                                ResponseContentPart::InputImage { .. }
+                                | ResponseContentPart::Unknown => None,
                             })
                             .collect::<Vec<_>>()
                             .join("\n")

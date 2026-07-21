@@ -17,32 +17,12 @@ use super::{
 use crate::{builders::ResponsesResponseBuilder, validated::Normalizable};
 
 // ============================================================================
-// Helper: deserialize function_call_output.output as plain text
-// Accepts either `"string"` or `[{"type":"input_text","text":"..."},...]`.
+// function_call_output.output: plain string OR a content-block array
+// (`[{"type":"input_text","text":"..."}, {"type":"input_image", ...}]`).
+// See `FunctionCallOutputContent` below — images are preserved rather than
+// silently dropped, since tools like a `view_image`/screenshot tool return
+// image data this way.
 // ============================================================================
-fn deserialize_output_as_text<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let val = Value::deserialize(deserializer)?;
-    match val {
-        Value::String(s) => Ok(s),
-        Value::Array(arr) => {
-            // Extract text from content-block array
-            let mut parts: Vec<String> = Vec::new();
-            for item in &arr {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    parts.push(text.to_owned());
-                }
-            }
-            Ok(parts.join(""))
-        }
-        other => Err(serde::de::Error::custom(format!(
-            "function_call_output.output must be a string or array, got: {}",
-            other
-        ))),
-    }
-}
 
 // ============================================================================
 // Response Tools (MCP and others)
@@ -223,11 +203,12 @@ pub enum ResponseInputOutputItem {
     FunctionCallOutput {
         id: Option<String>,
         call_id: String,
-        /// Accepts either a plain string or a content-block array
-        /// (`[{"type":"input_text","text":"..."}]`).
-        /// Internally always stored as a plain String (text extracted from blocks).
-        #[serde(deserialize_with = "deserialize_output_as_text")]
-        output: String,
+        /// Accepts either a plain string or a content-block array (e.g.
+        /// `[{"type":"input_text","text":"..."}]` or
+        /// `[{"type":"input_image","image_url":"..."}]`). Images are
+        /// preserved (not flattened to text) so tools like `view_image`
+        /// can round-trip screenshots back to a vision-capable model.
+        output: FunctionCallOutputContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
     },
@@ -239,6 +220,37 @@ pub enum ResponseInputOutputItem {
         #[serde(rename = "type")]
         r#type: Option<String>,
     },
+}
+
+/// Value for `input_image.image_url`. Per the OpenAI spec this is normally a
+/// plain URL string (or a base64 data URI), but some clients emit an object
+/// form (e.g. `{"url": "...", "detail": "auto"}`) carrying extra fields.
+/// Accept both so images aren't dropped just because of the wrapper shape.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum ResponseImageUrlValue {
+    Url(String),
+    Object {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+impl ResponseImageUrlValue {
+    pub fn url(&self) -> &str {
+        match self {
+            ResponseImageUrlValue::Url(u) => u,
+            ResponseImageUrlValue::Object { url, .. } => url,
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            ResponseImageUrlValue::Url(_) => None,
+            ResponseImageUrlValue::Object { detail, .. } => detail.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -256,8 +268,58 @@ pub enum ResponseContentPart {
     },
     #[serde(rename = "input_text")]
     InputText { text: String },
+    /// Image content (e.g. `message.content` items, or a `view_image`-style
+    /// tool's `function_call_output.output`). Previously this had no
+    /// dedicated variant and fell through to `Unknown`, silently discarding
+    /// the image data before it ever reached the backend model.
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: ResponseImageUrlValue,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// `function_call_output.output`: either a plain string or a list of
+/// Responses-API content parts (see `ResponseContentPart`, notably
+/// `InputImage`). Accepting both instead of forcing everything through a
+/// text-only extraction means image parts survive the round trip instead of
+/// being silently discarded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FunctionCallOutputContent {
+    Text(String),
+    Parts(Vec<ResponseContentPart>),
+}
+
+impl FunctionCallOutputContent {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            FunctionCallOutputContent::Text(s) => s.is_empty(),
+            FunctionCallOutputContent::Parts(parts) => parts.is_empty(),
+        }
+    }
+
+    /// Text-only projection, for routing/logging/validation purposes where
+    /// images aren't meaningful (e.g. worker selection by prompt length).
+    /// Callers that need to preserve images should match on the enum
+    /// directly instead.
+    pub fn to_plain_text(&self) -> String {
+        match self {
+            FunctionCallOutputContent::Text(s) => s.clone(),
+            FunctionCallOutputContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ResponseContentPart::InputText { text } => Some(text.as_str()),
+                    ResponseContentPart::OutputText { text, .. } => Some(text.as_str()),
+                    ResponseContentPart::InputImage { .. } | ResponseContentPart::Unknown => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -806,7 +868,8 @@ impl GenerationRequest for ResponsesRequest {
                             .filter_map(|part| match part {
                                 ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                                 ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Unknown => None,
+                                ResponseContentPart::InputImage { .. }
+                                | ResponseContentPart::Unknown => None,
                             })
                             .collect();
                         if texts.is_empty() {
@@ -854,7 +917,7 @@ impl GenerationRequest for ResponsesRequest {
                         Some(arguments.clone())
                     }
                     ResponseInputOutputItem::FunctionCallOutput { output, .. } => {
-                        Some(output.clone())
+                        Some(output.to_plain_text())
                     }
                 })
                 .collect::<Vec<String>>()

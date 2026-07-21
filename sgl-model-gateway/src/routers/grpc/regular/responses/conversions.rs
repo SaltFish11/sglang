@@ -11,11 +11,12 @@ use crate::{
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
         common::{
-            FunctionCallResponse, JsonSchemaFormat, ResponseFormat, StreamOptions, ToolCall,
-            UsageInfo,
+            ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat,
+            StreamOptions, ToolCall, UsageInfo,
         },
         responses::{
-            ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
+            FunctionCallOutputContent, ResponseContentPart, ResponseInput,
+            ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
             ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
         },
@@ -58,34 +59,23 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
             for item in items {
                 match item {
                     ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        // Convert SimpleInputMessage to chat message
-                        let text = match content {
-                            StringOrContentParts::String(s) => s.clone(),
-                            StringOrContentParts::Array(parts) => {
-                                // Extract text from content parts (only InputText supported)
-                                parts
-                                    .iter()
-                                    .filter_map(|part| match part {
-                                        ResponseContentPart::InputText { text } => {
-                                            Some(text.as_str())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            }
+                        // Convert SimpleInputMessage to chat message. Images are
+                        // preserved (not just InputText) via `convert_content_parts`.
+                        let message_content = match content {
+                            StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
+                            StringOrContentParts::Array(parts) => convert_content_parts(parts),
                         };
 
-                        messages.push(role_to_chat_message(role.as_str(), text));
+                        messages.push(role_to_chat_message(role.as_str(), message_content));
                     }
                     ResponseInputOutputItem::Message { role, content, .. } => {
-                        // Extract text from content parts
-                        let text = extract_text_from_content(content);
+                        // Extract content parts, preserving images alongside text.
+                        let message_content = convert_content_parts(content);
 
-                        messages.push(role_to_chat_message(role.as_str(), text));
+                        messages.push(role_to_chat_message(role.as_str(), message_content));
                     }
                     ResponseInputOutputItem::FunctionToolCall {
-                        id,
+                        id: _,
                         call_id,
                         name,
                         arguments,
@@ -95,11 +85,17 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         // Tool call from history - add as assistant message with tool call
                         // followed by tool response if output exists
                         //
-                        // `id` is optional (server-assigned metadata, see the
-                        // `ResponseInputOutputItem::FunctionToolCall` doc comment);
-                        // fall back to `call_id`, which is always present and is
-                        // what downstream ChatMessage::Tool matching keys off of.
-                        let effective_id = id.clone().unwrap_or_else(|| call_id.clone());
+                        // Use `call_id` (always present) rather than the optional
+                        // `id` here: `call_id` is the field that correlates this
+                        // function_call with a *separate* `function_call_output`
+                        // item (see the `ResponseInputOutputItem::FunctionCallOutput`
+                        // branch below, which keys `tool_call_id` off `call_id`).
+                        // `id` is a distinct, unrelated identifier (e.g. `fc_...`
+                        // vs `call_...`) and using it here would silently break
+                        // that correlation. This mirrors the Python reference
+                        // implementation's `call_id or id` precedence in
+                        // `serving_responses.py::_normalize_response_message_for_chat`.
+                        let effective_id = call_id.clone();
 
                         // Add assistant message with tool_calls (the LLM's decision)
                         messages.push(ChatMessage::Assistant {
@@ -144,11 +140,14 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                     ResponseInputOutputItem::FunctionCallOutput {
                         call_id, output, ..
                     } => {
-                        // Function call output - add as tool message
+                        // Function call output - add as tool message. Images
+                        // (e.g. from a `view_image`-style tool) are preserved
+                        // via `function_call_output_to_message_content`
+                        // instead of being flattened to text and dropped.
                         // Note: The function name is looked up from prev_outputs in Harmony path
                         // For Chat path, we just use the call_id
                         messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.clone()),
+                            content: function_call_output_to_message_content(output),
                             tool_call_id: call_id.clone(),
                         });
                     }
@@ -217,29 +216,75 @@ fn extract_text_from_content(content: &[ResponseContentPart]) -> String {
         .join("")
 }
 
-/// Convert role and text to ChatMessage
-fn role_to_chat_message(role: &str, text: String) -> ChatMessage {
+/// Convert a single Responses-API content part to a Chat Completions content
+/// part. Returns `None` for parts with no Chat Completions equivalent
+/// (currently just `Unknown`).
+fn response_content_part_to_chat(part: &ResponseContentPart) -> Option<ContentPart> {
+    match part {
+        ResponseContentPart::InputText { text } | ResponseContentPart::OutputText { text, .. } => {
+            Some(ContentPart::Text { text: text.clone() })
+        }
+        ResponseContentPart::InputImage { image_url, detail } => Some(ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: image_url.url().to_string(),
+                detail: image_url
+                    .detail()
+                    .map(str::to_string)
+                    .or_else(|| detail.clone())
+                    .or_else(|| Some("auto".to_string())),
+            },
+        }),
+        ResponseContentPart::Unknown => None,
+    }
+}
+
+/// Convert a Responses-API content-part array to Chat Completions
+/// `MessageContent`, preserving images instead of dropping them.
+///
+/// When the parts are all text (the common case), this collapses to a plain
+/// `MessageContent::Text` — identical to the previous text-only behavior —
+/// so pure-text conversations are unaffected. `MessageContent::Parts` is
+/// only used once at least one image is present.
+fn convert_content_parts(parts: &[ResponseContentPart]) -> MessageContent {
+    let has_image = parts
+        .iter()
+        .any(|part| matches!(part, ResponseContentPart::InputImage { .. }));
+    if !has_image {
+        return MessageContent::Text(extract_text_from_content(parts));
+    }
+    MessageContent::Parts(
+        parts
+            .iter()
+            .filter_map(response_content_part_to_chat)
+            .collect(),
+    )
+}
+
+/// Convert a `function_call_output.output` value to Chat Completions
+/// `MessageContent`. Mirrors `convert_content_parts`: text-only outputs stay
+/// a plain string, outputs containing images become `MessageContent::Parts`
+/// so tools like `view_image` can round-trip screenshots to the model.
+fn function_call_output_to_message_content(output: &FunctionCallOutputContent) -> MessageContent {
+    match output {
+        FunctionCallOutputContent::Text(s) => MessageContent::Text(s.clone()),
+        FunctionCallOutputContent::Parts(parts) => convert_content_parts(parts),
+    }
+}
+
+/// Convert role and content to ChatMessage
+fn role_to_chat_message(role: &str, content: MessageContent) -> ChatMessage {
     match role {
-        "user" => ChatMessage::User {
-            content: MessageContent::Text(text),
-            name: None,
-        },
+        "user" => ChatMessage::User { content, name: None },
         "assistant" => ChatMessage::Assistant {
-            content: Some(MessageContent::Text(text)),
+            content: Some(content),
             name: None,
             tool_calls: None,
             reasoning_content: None,
         },
-        "system" => ChatMessage::System {
-            content: MessageContent::Text(text),
-            name: None,
-        },
+        "system" => ChatMessage::System { content, name: None },
         _ => {
             // Unknown role, treat as user message
-            ChatMessage::User {
-                content: MessageContent::Text(text),
-                name: None,
-            }
+            ChatMessage::User { content, name: None }
         }
     }
 }
@@ -431,5 +476,136 @@ mod tests {
         // Empty text should still create a user message, so this should succeed
         let result = responses_to_chat(&req);
         assert!(result.is_ok());
+    }
+
+    /// Regression test for a `function_call`/`function_call_output` pair whose
+    /// `id` and `call_id` differ (the normal case for real Responses API
+    /// clients, e.g. `id: "fc_..."` vs `call_id: "call_..."`). The assistant
+    /// message's `tool_calls[0].id` must match the following tool message's
+    /// `tool_call_id` — both must key off `call_id`, not `id` — otherwise the
+    /// backend can't correlate the tool call with its result.
+    #[test]
+    fn test_function_call_output_correlates_via_call_id_not_id() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![
+                ResponseInputOutputItem::FunctionToolCall {
+                    id: Some("fc1".to_string()),
+                    call_id: "c1".to_string(),
+                    name: "view_image".to_string(),
+                    arguments: "{}".to_string(),
+                    output: None,
+                    status: Some("in_progress".to_string()),
+                },
+                ResponseInputOutputItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "c1".to_string(),
+                    output: FunctionCallOutputContent::Text("done".to_string()),
+                    status: None,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert_eq!(chat_req.messages.len(), 2);
+
+        let ChatMessage::Assistant { tool_calls, .. } = &chat_req.messages[0] else {
+            panic!("expected assistant message, got {:?}", chat_req.messages[0]);
+        };
+        let tool_call_id = &tool_calls.as_ref().unwrap()[0].id;
+
+        let ChatMessage::Tool { tool_call_id: output_tool_call_id, .. } = &chat_req.messages[1]
+        else {
+            panic!("expected tool message, got {:?}", chat_req.messages[1]);
+        };
+
+        // Both must key off call_id ("c1"), not id ("fc1").
+        assert_eq!(tool_call_id, "c1");
+        assert_eq!(output_tool_call_id, "c1");
+        assert_eq!(tool_call_id, output_tool_call_id);
+    }
+
+    /// A `message` item whose content mixes `input_text` and `input_image`
+    /// must preserve the image as a `ContentPart::ImageUrl` instead of
+    /// silently dropping it (the pre-fix behavior for the unrecognized
+    /// `input_image` variant).
+    #[test]
+    fn test_message_with_input_image_preserves_image() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::Message {
+                id: "msg_1".to_string(),
+                role: "user".to_string(),
+                content: vec![
+                    ResponseContentPart::InputText {
+                        text: "describe this image".to_string(),
+                    },
+                    ResponseContentPart::InputImage {
+                        image_url: crate::protocols::responses::ResponseImageUrlValue::Url(
+                            "data:image/png;base64,AAAA".to_string(),
+                        ),
+                        detail: None,
+                    },
+                ],
+                status: None,
+            }]),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert_eq!(chat_req.messages.len(), 1);
+
+        let ChatMessage::User { content, .. } = &chat_req.messages[0] else {
+            panic!("expected user message, got {:?}", chat_req.messages[0]);
+        };
+        let MessageContent::Parts(parts) = content else {
+            panic!("expected MessageContent::Parts, got {:?}", content);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        match &parts[1] {
+            ContentPart::ImageUrl { image_url } => {
+                assert_eq!(image_url.url, "data:image/png;base64,AAAA");
+                assert_eq!(image_url.detail.as_deref(), Some("auto"));
+            }
+            other => panic!("expected ContentPart::ImageUrl, got {:?}", other),
+        }
+    }
+
+    /// A `function_call_output` whose `output` is a content-part array
+    /// containing an `input_image` (e.g. a `view_image`-style tool result)
+    /// must preserve the image instead of being flattened to empty text.
+    #[test]
+    fn test_function_call_output_with_image_preserves_image() {
+        let req = ResponsesRequest {
+            input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
+                id: None,
+                call_id: "c1".to_string(),
+                output: FunctionCallOutputContent::Parts(vec![ResponseContentPart::InputImage {
+                    image_url: crate::protocols::responses::ResponseImageUrlValue::Url(
+                        "data:image/png;base64,AAAA".to_string(),
+                    ),
+                    detail: None,
+                }]),
+                status: None,
+            }]),
+            ..Default::default()
+        };
+
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert_eq!(chat_req.messages.len(), 1);
+
+        let ChatMessage::Tool {
+            content,
+            tool_call_id,
+        } = &chat_req.messages[0]
+        else {
+            panic!("expected tool message, got {:?}", chat_req.messages[0]);
+        };
+        assert_eq!(tool_call_id, "c1");
+        let MessageContent::Parts(parts) = content else {
+            panic!("expected MessageContent::Parts, got {:?}", content);
+        };
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0], ContentPart::ImageUrl { .. }));
     }
 }

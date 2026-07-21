@@ -2,8 +2,9 @@ use serde_json::json;
 use smg::protocols::{
     common::{Function, StringOrArray, ToolChoice, ToolChoiceValue},
     responses::{
-        IncludeField, ResponseInput, ResponseInputOutputItem, ResponseTool, ResponseToolType,
-        ResponsesRequest, StringOrContentParts, TextConfig, TextFormat,
+        FunctionCallOutputContent, IncludeField, ResponseInput, ResponseInputOutputItem,
+        ResponseTool, ResponseToolType, ResponsesRequest, StringOrContentParts, TextConfig,
+        TextFormat,
     },
 };
 use validator::Validate;
@@ -944,7 +945,7 @@ fn test_validate_input_items_structure() {
         input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
             id: None,
             call_id: "call_123".to_string(),
-            output: "result".to_string(),
+            output: FunctionCallOutputContent::Text("result".to_string()),
             status: None,
         }]),
         ..Default::default()
